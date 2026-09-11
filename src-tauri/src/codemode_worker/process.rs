@@ -59,23 +59,48 @@ fn pipe_error(error: super::FrameError) -> Event {
     }
 }
 
-fn exit_reason(child: &mut Child) -> String {
+fn exit_grace() -> Duration {
     // Windows can close the pipes hundreds of milliseconds before signaling
     // the process handle. Give the dedicated memory exit code time to become
     // observable, while keeping even a broken worker's cleanup bounded.
-    let grace = if cfg!(windows) {
+    if cfg!(windows) {
         Duration::from_secs(1)
     } else {
         Duration::from_millis(25)
-    };
-    let until = Instant::now() + grace;
+    }
+}
+
+fn memory_budget_error() -> String {
+    format!(
+        "code mode script exceeded its memory budget ({} MiB)",
+        super::MEMORY_LIMIT_BYTES / (1024 * 1024)
+    )
+}
+
+/// A worker that exceeds its memory budget calls `_exit` from the thread that
+/// trips the allocator, so another thread can be inside a stdout write and the
+/// parent reads a truncated frame. Wait out the same exit-signal window
+/// `exit_reason` uses, then report a memory termination when one is present.
+fn memory_termination(child: &mut Child) -> Option<String> {
+    let until = Instant::now() + exit_grace();
     loop {
         match child.try_wait() {
             Ok(Some(status)) if memory::is_memory_termination(&status) => {
-                return format!(
-                    "code mode script exceeded its memory budget ({} MiB)",
-                    super::MEMORY_LIMIT_BYTES / (1024 * 1024)
-                );
+                return Some(memory_budget_error());
+            }
+            Ok(Some(_)) => return None,
+            _ if Instant::now() >= until => return None,
+            _ => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
+fn exit_reason(child: &mut Child) -> String {
+    let until = Instant::now() + exit_grace();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if memory::is_memory_termination(&status) => {
+                return memory_budget_error();
             }
             Ok(Some(status)) => {
                 return format!("code mode worker terminated before returning a result ({status})")
@@ -223,7 +248,16 @@ pub fn run_script(
             Event::PipeClosed(error) => {
                 break Err(format!("{}: {error}", exit_reason(&mut child.0)));
             }
-            Event::Failure(error) => break Err(error),
+            Event::Failure(error) => {
+                // A worker killed for exceeding its budget can be torn down
+                // mid-write, so a truncated frame may surface here instead of a
+                // clean pipe close. Attribute a memory termination with the same
+                // message the pipe-close path uses.
+                break Err(match memory_termination(&mut child.0) {
+                    Some(reason) => format!("{reason}: {error}"),
+                    None => error,
+                });
+            }
             Event::HostReply(frame) => {
                 inflight -= 1;
                 if outgoing.try_send(frame).is_err() {
